@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import time
+import uuid
 import os
 import json
 import modeling
@@ -32,7 +34,7 @@ flags.DEFINE_integer("max_predictions_per_seq", 20,
 "In this task, it also refers to maximum number of masked tokens per word.")
 
 flags.DEFINE_string(
-    "bert_config_file", None,
+    "bert_config_file", "model/chinese_wwm_ext_L-12_H-768_A-12/bert_config.json",
     "The config json file corresponding to the pre-trained BERT model. "
     "This specifies the model architecture.")
 
@@ -42,10 +44,10 @@ flags.DEFINE_string(
     "This specifies the model architecture.")
 
 flags.DEFINE_string(
-    "output_dir", None,
+    "output_dir", "tmp",
     "The output directory where the model checkpoints will be written.")
 
-flags.DEFINE_string("vocab_file", None,
+flags.DEFINE_string("vocab_file", "model/chinese_wwm_ext_L-12_H-768_A-12/vocab.txt",
                     "The vocabulary file that the BERT model was trained on.")
 
 ## Other parameters
@@ -116,6 +118,11 @@ def read_examples(input_file):
       unique_id += 1
   return examples
 
+def read_sentence(sentence):
+  """Read a list of `InputExample`s from an input file."""
+  line = tokenization.convert_to_unicode(sentence)
+  line = line.strip()
+  return [InputExample(0, line)]
 
 def model_fn_builder(bert_config, init_checkpoint, use_tpu,
                      use_one_hot_embeddings):
@@ -180,8 +187,6 @@ def model_fn_builder(bert_config, init_checkpoint, use_tpu,
   return model_fn
 
 
-
-
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
                          label_ids):
   """Get loss and log probs for the masked LM."""
@@ -238,7 +243,6 @@ def gather_indexes(sequence_tensor, positions):
 
 def input_fn_builder(features, seq_length, max_predictions_per_seq):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
-
   all_input_ids = []
   all_input_mask = []
   all_segment_ids = []
@@ -425,7 +429,6 @@ def parse_result(result, all_tokens, output_file=None):
     i = 0
     sentences = []
     for word_loss in result:
-      # start of a sentence
       if all_tokens[i] == "[CLS]":
         sentence = {}
         tokens = []
@@ -439,7 +442,6 @@ def parse_result(result, all_tokens, output_file=None):
       sentence_loss += word_loss[0]
       word_count_per_sent += 1
       i += 1
-
       token_count_per_word = 0
       while is_subtoken(all_tokens[i]):
         token_count_per_word += 1
@@ -447,7 +449,6 @@ def parse_result(result, all_tokens, output_file=None):
                        "prob": float(np.exp(-word_loss[token_count_per_word]))})
         sentence_loss += word_loss[token_count_per_word]
         i += 1
-
       # end of a sentence
       if all_tokens[i] == "[SEP]":
         sentence["tokens"] = tokens
@@ -458,71 +459,51 @@ def parse_result(result, all_tokens, output_file=None):
     if output_file is not None:
       tf.logging.info("Saving results to %s" % output_file)
       writer.write(json.dumps(sentences, indent=2, ensure_ascii=False))
+    return sentence
 
-def main(_):
-  tf.logging.set_verbosity(tf.logging.INFO)
+def get_sentence_score(sentence):
+  """
+  Given a sentence, output the approximated perplexity score 
+  generated using BERT.
+  During the process, store the perplexity scores in local disk for 
+  future reference.
 
+  Args:
+      sentence (str): a sequence of characters to get perplexity.
+
+  Returns:
+      float: the perplexity score for the sentence passed in.
+  """
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  if len(sentence) > bert_config.max_position_embeddings:
+    return 0.0
 
-  if FLAGS.max_seq_length > bert_config.max_position_embeddings:
-    raise ValueError(
-        "Cannot use sequence length %d because the BERT model "
-        "was only trained up to sequence length %d" %
-        (FLAGS.max_seq_length, bert_config.max_position_embeddings))
-
-  tf.gfile.MakeDirs(FLAGS.output_dir)
-
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+  predict_examples = read_sentence(sentence)
+  features, all_tokens = convert_examples_to_features(predict_examples,
+                                                      len(sentence),
+                                                      tokenizer)
   run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
+      cluster=None,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
       tpu_config=tf.contrib.tpu.TPUConfig(
           num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
-
-
+          per_host_input_for_training=tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2))
+  predict_input_fn = input_fn_builder(
+      features=features,
+      seq_length=FLAGS.max_seq_length,
+      max_predictions_per_seq=FLAGS.max_predictions_per_seq)
   model_fn = model_fn_builder(
       bert_config=bert_config,
       init_checkpoint=FLAGS.init_checkpoint,
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
-
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
   estimator = tf.contrib.tpu.TPUEstimator(
       use_tpu=FLAGS.use_tpu,
       model_fn=model_fn,
       config=run_config,
       predict_batch_size=FLAGS.predict_batch_size)
-
-
-  predict_examples = read_examples(FLAGS.input_file)
-  features, all_tokens = convert_examples_to_features(predict_examples,
-                                          FLAGS.max_seq_length, tokenizer)
-
-  tf.logging.info("***** Running prediction*****")
-  tf.logging.info("  Num examples = %d", len(predict_examples))
-  tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
-
-  if FLAGS.use_tpu:
-    # Warning: According to tpu_estimator.py Prediction on TPU is an
-    # experimental feature and hence not supported here
-    raise ValueError("Prediction in TPU not supported")
-
-  predict_input_fn = input_fn_builder(
-      features=features,
-      seq_length=FLAGS.max_seq_length,
-      max_predictions_per_seq=FLAGS.max_predictions_per_seq)
-
   result = estimator.predict(input_fn=predict_input_fn)
-  output_predict_file = os.path.join(FLAGS.output_dir, "test_results.json")
-  parse_result(result, all_tokens, output_predict_file)
-
-if __name__ == "__main__":
-  tf.app.run()
+  output_predict_file = "tmp/{}-lm-score.json".format(time.time())
+  results = parse_result(result, all_tokens, output_predict_file)
+  return results["ppl"]
